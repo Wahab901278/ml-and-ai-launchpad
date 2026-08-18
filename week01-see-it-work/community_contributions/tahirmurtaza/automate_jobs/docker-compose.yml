@@ -1,0 +1,51 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n-jobs
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+
+    # Feeds GEMINI_API_KEY, APIFY_TOKEN, JOBS_SHEET_ID,
+    # RESUME_FILE_ID and N8N_BLOCK_ENV_ACCESS_IN_NODE.
+    #
+    # NOTE: this loader does NOT strip inline comments — `KEY=value # note`
+    # would pass the comment through as part of the value. Keep comments on
+    # their own line and run `node scripts/check-env.mjs` to verify.
+    env_file:
+      - .env
+
+    environment:
+      # The Schedule Trigger fires in this zone. Without it the container runs
+      # UTC and the "08:00" daily scan would fire at 13:00 Karachi time.
+      - GENERIC_TIMEZONE=Asia/Karachi
+      - TZ=Asia/Karachi
+
+      # Keep the OAuth callback and webhook URLs on localhost:5678, matching
+      # the redirect URI already registered in Google Cloud Console.
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_WEBHOOK_URL=http://localhost:5678/
+
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_DIAGNOSTICS_ENABLED=false
+
+    volumes:
+      # Named volume holds the SQLite DB, credentials and encryption key.
+      # Deleting it means re-entering every credential, so back it up before
+      # any `docker compose down -v`.
+      - n8n_data:/home/node/.n8n
+
+      # Read-only mount so you can import workflows from inside the container.
+      - ./workflows:/workflows:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  n8n_data:
