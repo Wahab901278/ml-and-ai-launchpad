@@ -16,7 +16,7 @@ pipeline, imported and combined in a main script.
 import data_cleaning
 
 # import specific functions directly, so they can be called by name
-from stats import average, highest, lowest
+from stats import average, highest, lowest,total
 
 # import a module under a shorter alias
 import data_cleaning as clean
@@ -28,10 +28,11 @@ def main():
     raw_scores = [70, None, 85, -5, 90, "invalid", 60, None, 75]
 
     scores = clean.fill_missing(raw_scores, default=0)
-    scores = data_cleaning.remove_invalid(scores)
+    scores = clean.remove_invalid(scores)
+
 
     print("cleaned scores:", scores)
-    print("total:", sum(scores))
+    print("total:", total(scores))
     print("average:", average(scores))
     print("highest:", highest(scores))
     print("lowest:", lowest(scores))
