@@ -1,0 +1,1081 @@
+{
+  "id": "WSp8Uc3phSppbZUo",
+  "name": "01 — Daily Job Scan",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "0001-daily-trigger",
+      "name": "Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Runs once per day at 08:00 local time."
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "0002-run-now-manual",
+      "name": "Run Now (manual)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        300,
+        0
+      ],
+      "notes": "Test entry point. Does not affect the daily schedule."
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ {\n  \"keywords\": [\"AI engineer\", \"AI automation engineer\", \"full stack developer\"],\n  \"locations\": [\"Pakistan\"],\n  \"datePosted\": \"week\",\n\n  \"apifyActor\": \"worldunboxer~rapid-linkedin-scraper\",\n  \"apifyJobsEntries\": 100,\n  \"apifyExperience\": \"Mid-Senior\",\n  \"apifyEmploymentType\": \"Full-time\",\n  \"apifyWorkArrangement\": \"\",\n  \"apifyEasyApply\": false,\n\n  \"minMatchScore\": 60,\n  \"maxJobsPerDay\": 12,\n\n  \"geminiFastModel\": \"gemini-3.6-flash\",\n  \"geminiProModel\": \"gemini-pro-latest\",\n\n  \"sheetId\": $env.JOBS_SHEET_ID,\n  \"resumeFileId\": $env.RESUME_FILE_ID,\n  \"candidateLocation\": \"Karachi, Pakistan. Fully authorized to work in Pakistan — no visa or sponsorship needed for any Pakistan-based role. Open to onsite, hybrid and remote work within Pakistan, and to remote roles for foreign companies that hire international contractors.\",\n  \"yourName\": \"Tahir Murtaza\",\n  \"summaryTo\": \"tahirmurtaza5152@gmail.com\"\n} }}",
+        "options": {}
+      },
+      "id": "0003-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        600,
+        0
+      ],
+      "notes": "sheetId and resumeFileId come from the container environment (.env), so there is nothing to paste here. Re-run scripts/check-env.mjs to confirm the Gemini model IDs still exist — Google rotates these often."
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.resumeFileId }}",
+          "mode": "id"
+        },
+        "options": {
+          "googleFileConversion": {
+            "conversion": {
+              "docsToFormat": "text/plain"
+            }
+          }
+        }
+      },
+      "id": "0004-download-master-resume",
+      "name": "Download Master Resume",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        900,
+        0
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "j4xLHJ4M4u2PgEYl",
+          "name": "Google Drive account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "id": "0005-extract-resume-text",
+      "name": "Extract Resume Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        0
+      ],
+      "notes": "If your master resume is a .docx or Google Doc, switch operation to \"text\" — the Drive node above already converts Google Docs to plain text."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalise whatever the extractor produced into one clean string and stash\n// it on the workflow's static data so later nodes can read it cheaply.\nconst item = $input.first().json;\nconst text = (item.text || item.data || '').replace(/\\r/g, '').trim();\n\nif (text.length < 200) {\n  throw new Error(\n    'Resume text came back as ' + text.length + ' chars. That is almost ' +\n    'certainly a failed extraction — check the Drive file ID and file type.'\n  );\n}\n\nreturn [{ json: { resumeText: text, resumeChars: text.length } }];"
+      },
+      "id": "0006-hold-resume-text",
+      "name": "Hold Resume Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// This actor takes jobs_titles as an ARRAY, so all keywords go in ONE run.\n// Billing is per result, so apifyJobsEntries is the real cost lever:\n// roughly $0.0005 per row (1000 rows measured at ~$0.52).\nconst cfg = $('Config').first().json;\nconst resume = $('Hold Resume Text').first().json;\n\n// The actor expects LinkedIn's human-readable recency labels.\nconst POSTED_WITHIN = {\n  today: 'Past 24 hours',\n  '3days': 'Past Week',\n  week: 'Past Week',\n  month: 'Past Month',\n  all: 'Any Time',\n};\n\n// The actor's location field is a single string, so multiple locations mean\n// one actor run each. Cost scales with locations x apifyJobsEntries, so\n// apifyJobsEntries is PER RUN, not per day — drop it when adding locations.\nconst locations = Array.isArray(cfg.locations)\n  ? cfg.locations\n  : [cfg.locations || 'Worldwide'];\n\nconst clean = locations\n  .map((l) => String(l ?? '').trim())\n  .filter(Boolean)\n  .map((l) => (l === 'Anywhere' ? 'Worldwide' : l));\n\nif (!clean.length) throw new Error('Config.locations is empty — set at least one location.');\n\nconsole.log(\n  'Searching ' + clean.length + ' location(s): ' + clean.join(', ') +\n  ' x ' + cfg.apifyJobsEntries + ' results each'\n);\n\nreturn clean.map((location) => ({\n  json: {\n    jobs_titles: cfg.keywords,\n    location,\n    posted_within: POSTED_WITHIN[cfg.datePosted] ?? 'Past Week',\n    resumeText: resume.resumeText,\n  },\n}));"
+      },
+      "id": "0007-build-search-queries",
+      "name": "Build Search Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.apify.com/v2/acts/{{ $('Config').first().json.apifyActor }}/run-sync-get-dataset-items?token={{ $env.APIFY_TOKEN }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.fromEntries(Object.entries({\n  jobs_titles: $json.jobs_titles,\n  location: $json.location,\n  posted_within: $json.posted_within,\n  jobs_entries: $('Config').first().json.apifyJobsEntries,\n  experience: $('Config').first().json.apifyExperience,\n  employment_type: $('Config').first().json.apifyEmploymentType,\n  work_arrangement: $('Config').first().json.apifyWorkArrangement,\n  easy_apply: $('Config').first().json.apifyEasyApply\n}).filter(([, v]) => v !== '' && v !== null && v !== undefined))) }}",
+        "options": {
+          "timeout": 300000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "0008-apify-linkedin-jobs",
+      "name": "Apify: LinkedIn Jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 15000,
+      "alwaysOutputData": true,
+      "notes": "Body matches worldunboxer/rapid-linkedin-scraper. Empty Config values are stripped so optional filters (work_arrangement) can be left off. A different actor needs a different body — check its Input tab."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Flatten discovery responses into one common job shape, drop duplicates and\n// drop anything without enough description text to score against.\n//\n// Written to survive a change of source: Apify returns a bare array of rows\n// (n8n splits it into one item each). Field names differ too, so every\n// value is read through a list of candidate keys rather than one hard-coded\n// spelling.\nconst out = new Map();\nconst problems = [];\nconst dropped = { redacted: 0, aggregator: 0, thin: 0, dupe: 0, incomplete: 0 };\nconst seenDupeKeys = new Set();\nlet sawRows = 0;\nlet sampleKeys = null;\n\n// Scraper/repost sites that republish listings with the real employer name\n// stripped out. They host on throwaway PaaS domains, so the employer's real\n// contact is unknowable and the JD is useless for a cover letter.\nconst AGGREGATOR_HOST = /(railway\\.app|liveblog365\\.com|herokuapp\\.com|vercel\\.app|netlify\\.app|onrender\\.com|repl\\.co|glitch\\.me)$/i;\nconst AGGREGATOR_NAME = /^(flexboard|remote click jobs|remote zest jobs|vacancy global pro|jobleads|grabjobs|recruit\\.net|joblist)/i;\n\n// These sites replace the employer name with a placeholder throughout the\n// text. One or two hits could be coincidence; repeated hits cannot.\nconst isRedacted = (text) =>\n  (text.match(/reputed company/gi) || []).length >= 3;\n\nconst first = (obj, names) => {\n  for (const n of names) {\n    const v = n.split('.').reduce((o, k) => (o == null ? o : o[k]), obj);\n    if (v !== undefined && v !== null && v !== '') return v;\n  }\n  return undefined;\n};\n\nconst looksLikeJob = (o) =>\n  o && typeof o === 'object' &&\n  Boolean(first(o, ['job_title', 'title', 'jobTitle', 'name']));\n\nconst findRows = (p) => {\n  // Apify's dataset endpoint returns a bare array, and n8n splits that into\n  // one item per row — so a payload may itself already BE a job.\n  if (looksLikeJob(p)) return [p];\n  const candidates = [\n    p?.data?.jobs, p?.data?.results, p?.data?.items,\n    p?.data, p?.jobs, p?.results, p?.items,\n  ];\n  return candidates.find((v) => Array.isArray(v));\n};\n\nfor (const item of $input.all()) {\n  const payload = item.json;\n  const rows = findRows(payload);\n\n  if (!rows) {\n    problems.push(\n      payload?.error?.message ??\n      payload?.message ??\n      'no jobs array found; top-level keys: ' + Object.keys(payload ?? {}).join(',') +\n        '; data keys: ' + Object.keys(payload?.data ?? {}).join(',')\n    );\n    continue;\n  }\n\n  sawRows += rows.length;\n\n  for (const j of rows) {\n    if (!sampleKeys) sampleKeys = Object.keys(j);\n\n    const title = String(first(j, ['job_title', 'title', 'jobTitle', 'name']) ?? '').trim();\n    const company = String(\n      first(j, ['employer_name', 'companyName', 'company_name', 'company', 'employer.name', 'organization']) ?? ''\n    ).trim();\n    // Strip the HTML variant so it never reaches the LLM as markup.\n    if (!first(j, ['job_description', 'descriptionText', 'description'])) {\n      const html = first(j, ['job_description_raw_html', 'descriptionHtml']);\n      if (html) j.description = String(html).replace(/<[^>]+>/g, ' ').replace(/s+/g, ' ').trim();\n    }\n    const description = String(\n      first(j, ['job_description', 'descriptionText', 'description', 'descriptionHtml', 'job_summary', 'snippet']) ?? ''\n    ).trim();\n\n    if (!title || !company || description.length < 200) { dropped.thin++; continue; }\n\n    // Reject reposts before they cost us Gemini quota.\n    if (isRedacted(description)) { dropped.redacted++; continue; }\n    if (AGGREGATOR_NAME.test(company)) { dropped.aggregator++; continue; }\n\n    // Prefer the real company domain so a found contact can be cached on it.\n    const website = first(j, [\n      'employer_website', 'companyWebsite', 'company_website', 'employer.website', 'company_url',\n    ]);\n    let domain = '';\n    try {\n      if (website) domain = new URL(String(website)).hostname.replace(/^www\\./, '');\n    } catch (e) { /* malformed URL, leave blank */ }\n\n    // companyLinkedinUrl and friends resolve to the job board, not the\n    // employer. A normalized domain of linkedin.com (or any other job\n    // board) is meaningless and would poison the contact cache.\n    // Match the registrable name anywhere in the host: LinkedIn serves\n    // country subdomains like in.linkedin.com, which an anchored pattern\n    // would let through.\n    if (/(^|\\.)(linkedin|indeed|glassdoor|ziprecruiter|monster|dice|jobgether|jobleads|naukri|bayt|rozee|wellfound|greenhouse|lever|workable|smartrecruiters)\\./i.test(domain)) {\n      domain = '';\n    }\n\n    if (domain && AGGREGATOR_HOST.test(domain)) { dropped.aggregator++; continue; }\n\n    // Prefer the source's own posting id: it is stable across runs even if\n    // the title is edited. Fall back to company+title only when absent.\n    const sourceId = String(first(j, ['job_id', 'jobId', 'id']) ?? '').trim();\n    const slug = (v) => String(v).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');\n\n    // Normalised title strips seniority/formatting noise so \"Sr. AI Engineer\"\n    // and \"Senior AI Engineer (Remote)\" collapse to one entry.\n    const titleKey = slug(\n      title\n        .replace(/[\\(\\[]\\s*(remote|hybrid|on-?site|contract|full[- ]?time|part[- ]?time)\\s*[\\)\\]]/gi, ' ')\n        .replace(/\\b(sr|snr)\\b\\.?/gi, 'senior')\n        .replace(/\\b(jr)\\b\\.?/gi, 'junior')\n        .replace(/\\s*[|\\-–—,].*$/, '')\n    );\n    const dupeKey = slug(company) + '::' + titleKey;\n\n    const key = sourceId ? 'lj-' + sourceId : dupeKey;\n\n    // Reject both an exact id repeat and a same-company same-role repeat.\n    if (out.has(key) || seenDupeKeys.has(dupeKey)) { dropped.dupe++; continue; }\n    seenDupeKeys.add(dupeKey);\n\n    const locationRaw = first(j, ['job_location', 'location']);\n    const location = typeof locationRaw === 'string'\n      ? locationRaw\n      : [\n          first(j, ['job_city', 'city', 'location.city']),\n          first(j, ['job_state', 'state', 'location.state']),\n          first(j, ['job_country', 'country', 'location.country']),\n        ].filter(Boolean).join(', ');\n\n    out.set(key, {\n      job_id: key,\n      dupe_key: dupeKey,\n      title,\n      company,\n      domain,\n      location,\n      is_remote: Boolean(first(j, ['job_is_remote', 'is_remote', 'remote'])) ||\n        /remote/i.test(String(first(j, ['job_location', 'location', 'workplaceType']) ?? '')),\n      url: String(first(j, ['job_apply_link', 'apply_link', 'apply_url', 'jobUrl', 'applyUrl', 'job_url', 'url', 'link', 'job_google_link']) ?? ''),\n      apply_is_direct: Boolean(first(j, ['job_apply_is_direct', 'apply_is_direct'])),\n      posted_at: String(first(j, ['job_posted_at_datetime_utc', 'postedAt', 'publishedAt', 'time_posted', 'posted_at', 'date_posted', 'job_posted_at']) ?? ''),\n      // This actor sometimes surfaces a contact address straight from the\n      // posting. When it does, it is the only contact we keep.\n      posting_email: String(first(j, ['contact_email', 'contactEmail']) ?? '').trim().toLowerCase(),\n      seniority: String(first(j, ['seniority_level', 'seniorityLevel']) ?? ''),\n      publisher: String(first(j, ['job_publisher', 'publisher', 'source']) ?? 'LinkedIn'),\n      description,\n    });\n  }\n}\n\n// Distinguish the three ways this can come back empty, so a quiet zero is\n// never mistaken for \"no jobs today\".\nif (!out.size) {\n  if (problems.length === $input.all().length) {\n    throw new Error(\n      'Every discovery response was unusable — API shape or subscription changed. ' +\n      'First problem: ' + problems[0]\n    );\n  }\n  if (sawRows > 0) {\n    // Distinguish \"field names changed\" from \"everything was spam\".\n    if (dropped.redacted + dropped.aggregator > 0) {\n      console.log(\n        'All ' + sawRows + ' results were filtered out: ' +\n        JSON.stringify(dropped) + '. Job boards were dominated by reposts today.'\n      );\n      return [];\n    }\n    throw new Error(\n      'Discovery returned ' + sawRows + ' rows but none had a usable title/company/' +\n      'description (needs 200+ chars). Field names likely changed. ' +\n      'Keys on the first row: ' + (sampleKeys ?? []).join(', ')\n    );\n  }\n  // rows existed but were genuinely empty — nothing posted in the window.\n  return [];\n}\n\nconsole.log(\n  'Kept ' + out.size + ' of ' + sawRows + ' results. Dropped: ' + JSON.stringify(dropped)\n);\n\nreturn [...out.values()].map((json) => ({ json }));"
+      },
+      "id": "0009-normalize-dedupe",
+      "name": "Normalize & Dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ],
+      "notes": "Deterministic. No LLM involved — cheap filtering before we spend quota."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Queue",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "0010-read-existing-queue",
+      "name": "Read Existing Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        200
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "7FbQUaSOembNsfPo",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Contacts",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "0011-read-contact-cache",
+      "name": "Read Contact Cache",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        400
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "7FbQUaSOembNsfPo",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Domain -> recruiter cache: reuse a posting email across repeat postings."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Config').first().json;\nconst jobs = $('Normalize & Dedupe').all().map((i) => i.json);\nconst prior = $('Read Existing Queue').all().map((i) => i.json);\n\nconst slug = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');\n\n// Three independent ways a posting can already be known, so a re-listing\n// under a new id, or an id scheme change, still will not produce a repeat.\nconst seenIds = new Set(prior.map((r) => r.job_id).filter(Boolean));\nconst seenUrls = new Set(prior.map((r) => String(r.url || '').trim()).filter(Boolean));\nconst seenPairs = new Set(prior.map((r) => slug(r.company) + '::' + slug(r.title)));\n\n// Don't re-approach the same company within 30 days, whatever the role.\nconst cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;\nconst recentCompanies = new Set(\n  $('Read Existing Queue')\n    .all()\n    .map((i) => i.json)\n    .filter((r) => r.date_found && Date.parse(r.date_found) > cutoff)\n    .map((r) => String(r.company || '').toLowerCase())\n);\n\nconst fresh = jobs\n  .filter((j) => !seenIds.has(j.job_id))\n  .filter((j) => !(j.url && seenUrls.has(j.url.trim())))\n  .filter((j) => !seenPairs.has(slug(j.company) + '::' + slug(j.title)))\n  .filter((j) => !(j.dupe_key && seenPairs.has(j.dupe_key)))\n  .filter((j) => !recentCompanies.has(j.company.toLowerCase()))\n  .slice(0, cfg.maxJobsPerDay);\n\nconsole.log(\n  'Discovered ' + jobs.length + ', already known ' + (jobs.length - fresh.length) +\n  ', processing ' + fresh.length\n);\n\nif (!fresh.length) return [];\nreturn fresh.map((json) => ({ json }));"
+      },
+      "id": "0012-filter-to-new-jobs",
+      "name": "Filter To New Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "0013-loop-over-jobs",
+      "name": "Loop Over Jobs",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        600,
+        400
+      ],
+      "notes": "One job at a time: keeps us under Gemini free-tier RPM."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.geminiFastModel }}:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  contents: [{ parts: [{ text:\n    \"You are a blunt technical recruiter. Compare the CANDIDATE RESUME to the JOB DESCRIPTION and score the fit.\\n\\n\" +\n    \"TODAY'S DATE IS \" + $now.toFormat('d LLLL yyyy') + \". \" +\n    \"Treat that as the present. Resume dates on or before it are in the past and are NOT errors — \" +\n    \"never flag recent or current employment dates as impossible or future.\\n\\n\" +\n    \"Rules:\\n\" +\n    \"- Score 0-100 on genuine fit. Be harsh. Most jobs are NOT a good fit.\\n\" +\n    \"- Never assume a skill the resume does not evidence.\\n\" +\n    \"- red_flags: hard blockers only. Treat these as blockers given the candidate's situation below: \" +\n    \"requires onsite/hybrid attendance in another country, requires existing work authorization the candidate lacks, \" +\n    \"explicitly excludes the candidate's region, requires security clearance, or demands far more years than the resume shows.\\n\" +\n    \"- ats_keywords: the exact hard terms an ATS would filter on, taken verbatim from the job description.\\n\\n\" +\n    \"CANDIDATE LOCATION & CONSTRAINTS: \" + $('Config').first().json.candidateLocation + \"\\n\\n\" +\n    \"CANDIDATE RESUME:\\n\" + $('Hold Resume Text').first().json.resumeText.slice(0, 12000) +\n    \"\\n\\nJOB TITLE: \" + $json.title +\n    \"\\nCOMPANY: \" + $json.company +\n    \"\\nJOB DESCRIPTION:\\n\" + $json.description.slice(0, 12000)\n  }] }],\n  generationConfig: {\n    temperature: 0.1,\n    responseMimeType: \"application/json\",\n    responseSchema: {\n      type: \"OBJECT\",\n      properties: {\n        match_score: { type: \"INTEGER\" },\n        verdict: { type: \"STRING\" },\n        matched_skills: { type: \"ARRAY\", items: { type: \"STRING\" } },\n        missing_skills: { type: \"ARRAY\", items: { type: \"STRING\" } },\n        ats_keywords: { type: \"ARRAY\", items: { type: \"STRING\" } },\n        red_flags: { type: \"ARRAY\", items: { type: \"STRING\" } },\n        reasoning: { type: \"STRING\" }\n      },\n      required: [\"match_score\", \"verdict\", \"matched_skills\", \"missing_skills\", \"ats_keywords\", \"red_flags\"]\n    }\n  }\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "0014-gemini-score-match",
+      "name": "Gemini: Score Match",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        400
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Gemini is asked for strict JSON, but never trust that blindly — a quota\n// error or a safety block returns a completely different shape.\nconst job = $('Loop Over Jobs').first().json;\nconst res = $input.first().json;\n\nfunction safeParse(raw) {\n  if (!raw) return null;\n  try { return JSON.parse(raw); } catch (e) {}\n  const m = raw.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) {} }\n  return null;\n}\n\nconst text = res?.candidates?.[0]?.content?.parts?.[0]?.text;\nconst parsed = safeParse(text);\n\nif (!parsed) {\n  return [{ json: {\n    ...job,\n    match_score: 0,\n    verdict: 'error',\n    matched_skills: [],\n    missing_skills: [],\n    ats_keywords: [],\n    red_flags: [],\n    error: 'Gemini returned no parsable JSON: ' + JSON.stringify(res?.error ?? res).slice(0, 300),\n  } }];\n}\n\nreturn [{ json: {\n  ...job,\n  match_score: Number(parsed.match_score) || 0,\n  verdict: parsed.verdict ?? '',\n  matched_skills: parsed.matched_skills ?? [],\n  missing_skills: parsed.missing_skills ?? [],\n  ats_keywords: parsed.ats_keywords ?? [],\n  red_flags: parsed.red_flags ?? [],\n  reasoning: parsed.reasoning ?? '',\n} }];"
+      },
+      "id": "0015-parse-match-result",
+      "name": "Parse Match Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "score",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              },
+              "leftValue": "={{ $json.match_score }}",
+              "rightValue": "={{ $('Config').first().json.minMatchScore }}"
+            },
+            {
+              "id": "noflags",
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json.red_flags.length }}",
+              "rightValue": 0
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0016-score-gate",
+      "name": "Score Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Deterministic ATS check against the MASTER resume (we are not rewriting it).\n// This tells you which keywords your resume is missing so you can decide\n// whether to hand-edit before applying.\nconst job = $input.first().json;\nconst resume = $('Hold Resume Text').first().json.resumeText.toLowerCase();\n\nconst keywords = (job.ats_keywords || [])\n  .map((k) => String(k).trim())\n  .filter((k) => k.length > 1);\n\nconst present = [];\nconst missing = [];\n\nfor (const kw of keywords) {\n  const needle = kw.toLowerCase();\n  // Word-ish boundary match so \"go\" doesn't match \"google\".\n  const re = new RegExp('(^|[^a-z0-9+#.])' + needle.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '([^a-z0-9+#.]|$)', 'i');\n  (re.test(resume) ? present : missing).push(kw);\n}\n\nconst ats_score = keywords.length\n  ? Math.round((present.length / keywords.length) * 100)\n  : 0;\n\nreturn [{ json: {\n  ...job,\n  ats_score,\n  ats_present: present,\n  ats_missing: missing,\n  ats_note: ats_score < 60\n    ? 'Low keyword coverage — consider hand-editing the resume before sending.'\n    : 'Coverage acceptable.',\n} }];"
+      },
+      "id": "0017-ats-keyword-score",
+      "name": "ATS Keyword Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.geminiProModel }}:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  contents: [{ parts: [{ text:\n    \"Write a cover letter for this candidate applying to this role.\\n\\n\" +\n    \"Hard rules:\\n\" +\n    \"- 180-240 words. Plain prose, no bullet points, no markdown.\\n\" +\n    \"- Use ONLY achievements that appear in the resume. Invent nothing: no metrics, employers, dates or skills that are not there.\\n\" +\n    \"- Open with a specific reason for this company/role, not a generic greeting.\\n\" +\n    \"- Name 2-3 of the matched skills naturally.\\n\" +\n    \"- Never mention the missing skills.\\n\" +\n    \"- End with a short call to action. Sign off as \" + $('Config').first().json.yourName + \".\\n\" +\n    \"- Also produce a concise email subject line (max 70 chars) referencing the role and company.\\n\\n\" +\n    \"MATCHED SKILLS: \" + ($json.matched_skills || []).join(', ') +\n    \"\\n\\nCANDIDATE RESUME:\\n\" + $('Hold Resume Text').first().json.resumeText.slice(0, 10000) +\n    \"\\n\\nJOB TITLE: \" + $json.title +\n    \"\\nCOMPANY: \" + $json.company +\n    \"\\nJOB DESCRIPTION:\\n\" + $json.description.slice(0, 8000)\n  }] }],\n  generationConfig: {\n    temperature: 0.6,\n    responseMimeType: \"application/json\",\n    responseSchema: {\n      type: \"OBJECT\",\n      properties: {\n        subject: { type: \"STRING\" },\n        cover_letter: { type: \"STRING\" }\n      },\n      required: [\"subject\", \"cover_letter\"]\n    }\n  }\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "0018-gemini-write-cover-letter",
+      "name": "Gemini: Write Cover Letter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        600
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const job = $('ATS Keyword Score').first().json;\nconst res = $input.first().json;\n\nfunction safeParse(raw) {\n  if (!raw) return null;\n  try { return JSON.parse(raw); } catch (e) {}\n  const m = raw.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) {} }\n  return null;\n}\n\nconst parsed = safeParse(res?.candidates?.[0]?.content?.parts?.[0]?.text) ?? {};\n\nreturn [{ json: {\n  ...job,\n  subject: parsed.subject || `Application: ${job.title} at ${job.company}`,\n  cover_letter: parsed.cover_letter || '',\n  cover_letter_ok: Boolean(parsed.cover_letter),\n} }];"
+      },
+      "id": "0019-parse-cover-letter",
+      "name": "Parse Cover Letter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const job = $input.first().json;\n\n// A contact address published in the posting itself is gold: it is free\n// and comes straight from the employer.\nif (job.posting_email && /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(job.posting_email)) {\n  return [{ json: {\n    ...job,\n    recruiter_name: '',\n    recruiter_email: job.posting_email,\n    recruiter_title: 'From job posting',\n    contact_source: 'posting',\n    // Cache it against the domain (when one exists) so repeat postings\n    // by the same company never have to be re-found.\n    cacheable: Boolean(job.domain),\n  } }];\n}\n\n// Reuse a domain's cached contact. Read by domain when we have one,\n// otherwise by company name.\nconst cacheKey = String(job.domain || job.company || '').toLowerCase();\nconst cache = $('Read Contact Cache').all().map((i) => i.json);\nconst hit = cacheKey\n  ? cache.find((c) =>\n      [c.domain, c.company].some((v) => String(v || '').toLowerCase() === cacheKey) &&\n      c.recruiter_email)\n  : null;\n\nif (hit) {\n  return [{ json: {\n    ...job,\n    recruiter_name: hit.recruiter_name || '',\n    recruiter_email: hit.recruiter_email,\n    recruiter_title: hit.recruiter_title || '',\n    contact_source: 'cache',\n    cacheable: false,\n  } }];\n}\n\nreturn [{ json: {\n  ...job,\n  recruiter_name: '',\n  recruiter_email: '',\n  recruiter_title: '',\n  contact_source: 'none',\n  cacheable: false,\n} }];"
+      },
+      "id": "0020-decide-contact",
+      "name": "Decide Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cacheable",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.cacheable }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0021-cache-contact",
+      "name": "Cache Contact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 2
+      },
+      "id": "0022-merge-contact-paths",
+      "name": "Merge Contact Paths",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        300,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const j = $input.first().json;\n\n// status drives the review column in the sheet:\n//   needs_review  -> we have a recruiter email, waiting on your review\n//   manual_apply  -> no email found, apply through the posting URL yourself\nconst status = j.recruiter_email ? 'needs_review' : 'manual_apply';\n\n// A row is only written when every field the review workflow depends on is\n// actually present. Half-filled rows are worse than\n// no row: they look actionable and fail at apply time.\nconst issues = [];\nif (!j.title) issues.push('no title');\nif (!j.company) issues.push('no company');\nif (!j.url) issues.push('no apply URL');\nif (!(j.description || '').trim()) issues.push('no description');\nif (!Number.isFinite(Number(j.match_score))) issues.push('no match score');\nif (!Number.isFinite(Number(j.ats_score))) issues.push('no ATS score');\nif (!(j.subject || '').trim()) issues.push('no email subject');\nif ((j.cover_letter || '').trim().length < 120) issues.push('cover letter missing or too short');\nif (j.recruiter_email && !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(j.recruiter_email)) {\n  issues.push('malformed recruiter email');\n}\n\nreturn [{ json: {\n  row_valid: issues.length === 0,\n  row_issues: issues.join('; '),\n  job_id: j.job_id,\n  date_found: new Date().toISOString(),\n  title: j.title,\n  company: j.company,\n  domain: j.domain || '',\n  location: j.location || '',\n  is_remote: j.is_remote ? 'TRUE' : 'FALSE',\n  url: j.url || '',\n  match_score: j.match_score,\n  ats_score: j.ats_score,\n  verdict: j.verdict || '',\n  matched_skills: (j.matched_skills || []).join(', '),\n  ats_missing: (j.ats_missing || []).join(', '),\n  ats_note: j.ats_note || '',\n  reasoning: (j.reasoning || '').slice(0, 900),\n  recruiter_name: j.recruiter_name || '',\n  recruiter_email: j.recruiter_email || '',\n  recruiter_title: j.recruiter_title || '',\n  contact_source: j.contact_source || '',\n  subject: j.subject || '',\n  cover_letter: j.cover_letter || '',\n  status,\n  sent_at: '',\n  notes: '',\n} }];"
+      },
+      "id": "0023-build-queue-row",
+      "name": "Build Queue Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "valid",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.row_valid }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0024-row-complete",
+      "name": "Row Complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        800
+      ],
+      "notes": "Incomplete rows go to the Skipped tab with a reason instead of being written to Queue as half-filled entries."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Queue",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [
+            "job_id"
+          ],
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "0025-append-to-queue",
+      "name": "Append To Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        800
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "7FbQUaSOembNsfPo",
+          "name": "Google Sheets account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Contacts",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "domain"
+          ],
+          "value": {
+            "domain": "={{ $json.domain }}",
+            "company": "={{ $json.company }}",
+            "recruiter_name": "={{ $json.recruiter_name }}",
+            "recruiter_email": "={{ $json.recruiter_email }}",
+            "recruiter_title": "={{ $json.recruiter_title }}",
+            "found_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "0026-cache-contact",
+      "name": "Cache Contact",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        1000
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "7FbQUaSOembNsfPo",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Stashes a posting-provided contact on the domain for reuse later."
+    },
+    {
+      "parameters": {
+        "amount": 8,
+        "unit": "seconds"
+      },
+      "id": "0027-throttle",
+      "name": "Throttle",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        300,
+        1000
+      ],
+      "notes": "Keeps Gemini free-tier requests-per-minute happy."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Skipped",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "date_found": "={{ $now.toISO() }}",
+            "job_id": "={{ $json.job_id }}",
+            "title": "={{ $json.title }}",
+            "company": "={{ $json.company }}",
+            "url": "={{ $json.url }}",
+            "match_score": "={{ $json.match_score }}",
+            "reason": "={{ $json.row_issues ? \"incomplete row: \" + $json.row_issues : (($json.red_flags || []).length ? \"red flags: \" + $json.red_flags.join(\"; \") : \"below match threshold\") }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "0028-log-skipped-job",
+      "name": "Log Skipped Job",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        600,
+        1000
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "7FbQUaSOembNsfPo",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Config').first().json;\nconst scanned = $('Normalize & Dedupe').all().length;\nconst considered = $('Filter To New Jobs').all().length;\n\nlet queued = [];\ntry { queued = $('Build Queue Row').all().map((i) => i.json); } catch (e) {}\n\nconst ready = queued.filter((q) => q.status === 'needs_review');\nconst manual = queued.filter((q) => q.status === 'manual_apply');\n\nconst row = (q) =>\n  `<tr>\n    <td style=\"padding:6px 10px;border-bottom:1px solid #eee\">${q.title}</td>\n    <td style=\"padding:6px 10px;border-bottom:1px solid #eee\">${q.company}</td>\n    <td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:center\">${q.match_score}</td>\n    <td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:center\">${q.ats_score}</td>\n    <td style=\"padding:6px 10px;border-bottom:1px solid #eee\">${q.recruiter_email || '—'}</td>\n  </tr>`;\n\nconst html = `\n  <div style=\"font-family:system-ui,sans-serif;max-width:720px\">\n    <h2 style=\"margin-bottom:4px\">Job scan — ${new Date().toDateString()}</h2>\n    <p style=\"color:#555\">\n      Scanned <b>${scanned}</b> postings ·\n      <b>${considered}</b> new ·\n      <b>${ready.length}</b> ready to review ·\n      <b>${manual.length}</b> need manual apply\n    </p>\n    ${queued.length ? `<table style=\"border-collapse:collapse;width:100%;font-size:14px\">\n      <tr style=\"text-align:left;background:#f6f6f6\">\n        <th style=\"padding:8px 10px\">Role</th><th style=\"padding:8px 10px\">Company</th>\n        <th style=\"padding:8px 10px\">Match</th><th style=\"padding:8px 10px\">ATS</th>\n        <th style=\"padding:8px 10px\">Recruiter</th>\n      </tr>\n      ${queued.map(row).join('')}\n    </table>` : '<p>No new matches today.</p>'}\n    <p style=\"margin-top:20px\">\n      <a href=\"https://docs.google.com/spreadsheets/d/{{ $('Config').first().json.sheetId }}\" style=\"background:#111;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none\">\n        Open review sheet\n      </a>\n    </p>\n    <p style=\"color:#888;font-size:12px\">Jobs are queued in Google Sheets. Review and apply from there.</p>\n  </div>`;\n\nreturn [{ json: { html, to: cfg.summaryTo, scanned, considered, ready: ready.length, manual: manual.length } }];"
+      },
+      "id": "0029-build-daily-summary",
+      "name": "Build Daily Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "=Job scan: {{ $json.ready }} ready to review, {{ $json.manual }} manual",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "0030-email-daily-summary",
+      "name": "Email Daily Summary",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1200,
+        1000
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "jsvTdnycSWSvSa6J",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Daily Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Download Master Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Master Resume": {
+      "main": [
+        [
+          {
+            "node": "Extract Resume Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Resume Text": {
+      "main": [
+        [
+          {
+            "node": "Hold Resume Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hold Resume Text": {
+      "main": [
+        [
+          {
+            "node": "Build Search Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Search Queries": {
+      "main": [
+        [
+          {
+            "node": "Apify: LinkedIn Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify: LinkedIn Jobs": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Dedupe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Dedupe": {
+      "main": [
+        [
+          {
+            "node": "Read Existing Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Existing Queue": {
+      "main": [
+        [
+          {
+            "node": "Read Contact Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Contact Cache": {
+      "main": [
+        [
+          {
+            "node": "Filter To New Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter To New Jobs": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Jobs": {
+      "main": [
+        [
+          {
+            "node": "Build Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini: Score Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Score Match": {
+      "main": [
+        [
+          {
+            "node": "Parse Match Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Match Result": {
+      "main": [
+        [
+          {
+            "node": "Score Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Gate": {
+      "main": [
+        [
+          {
+            "node": "ATS Keyword Score",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Skipped Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Skipped Job": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ATS Keyword Score": {
+      "main": [
+        [
+          {
+            "node": "Gemini: Write Cover Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Write Cover Letter": {
+      "main": [
+        [
+          {
+            "node": "Parse Cover Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Cover Letter": {
+      "main": [
+        [
+          {
+            "node": "Decide Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Contact": {
+      "main": [
+        [
+          {
+            "node": "Cache Contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache Contact?": {
+      "main": [
+        [
+          {
+            "node": "Cache Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Contact Paths",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Cache Contact": {
+      "main": [
+        [
+          {
+            "node": "Merge Contact Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Contact Paths": {
+      "main": [
+        [
+          {
+            "node": "Build Queue Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Queue Row": {
+      "main": [
+        [
+          {
+            "node": "Row Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Row Complete?": {
+      "main": [
+        [
+          {
+            "node": "Append To Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Skipped Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append To Queue": {
+      "main": [
+        [
+          {
+            "node": "Throttle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Daily Summary": {
+      "main": [
+        [
+          {
+            "node": "Email Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "versionId": "L81e738FmlXgAW4U",
+  "meta": {
+    "instanceId": "automate-jobs"
+  },
+  "tags": []
+}
