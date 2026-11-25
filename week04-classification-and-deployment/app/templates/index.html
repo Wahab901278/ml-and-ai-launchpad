@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two models, one app</title>
+<style>
+  :root { color-scheme: light dark; --line: #d8d8e0; --accent: #4c72b0; --warn: #c44e52; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 0 auto; max-width: 900px; padding: 2rem 1rem 4rem; line-height: 1.5; }
+  h1 { margin-bottom: .2rem; } .sub { opacity: .7; margin-top: 0; }
+  .tabs { display: flex; gap: .5rem; border-bottom: 2px solid var(--line); margin: 1.5rem 0; }
+  .tabs a { padding: .6rem 1rem; text-decoration: none; border-radius: 6px 6px 0 0;
+            color: inherit; font-weight: 600; }
+  .tabs a.active { background: var(--accent); color: #fff; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; }
+  label { display: block; font-size: .85rem; font-weight: 600; margin-bottom: .25rem; }
+  input, select { width: 100%; padding: .45rem; border: 1px solid var(--line);
+                  border-radius: 5px; background: transparent; color: inherit; }
+  button { margin-top: 1.2rem; padding: .6rem 1.4rem; border: 0; border-radius: 6px;
+           background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+  .result { margin-top: 1.5rem; padding: 1rem 1.2rem; border-left: 4px solid var(--accent);
+            background: rgba(76,114,176,.09); border-radius: 0 6px 6px 0; }
+  .result.flag { border-left-color: var(--warn); background: rgba(196,78,82,.1); }
+  .big { font-size: 2rem; font-weight: 700; }
+  .note { font-size: .82rem; opacity: .75; }
+  .err { padding: 1rem; border-left: 4px solid var(--warn); background: rgba(196,78,82,.1); }
+  code { background: rgba(127,127,127,.15); padding: .1rem .3rem; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Two models, one app</h1>
+<p class="sub">Week 3 regression and Week 4 classification, served by the same Flask process.</p>
+
+{% if load_error %}
+  <div class="err"><strong>Models not loaded.</strong><pre>{{ load_error }}</pre></div>
+{% else %}
+
+<div class="tabs">
+  <a href="?tab=charges" class="{{ 'active' if active == 'charges' else '' }}">💵 Charges Predictor</a>
+  <a href="?tab=diabetes" class="{{ 'active' if active == 'diabetes' else '' }}">🩺 Diabetes Risk</a>
+</div>
+
+{% set tab = request.args.get('tab', active) %}
+
+{% if tab == 'charges' %}
+<form method="post">
+  <input type="hidden" name="form" value="charges">
+  <div class="grid">
+    <div><label>Age</label><input type="number" name="age" min="18" max="100" value="{{ charges_values['age'] }}"></div>
+    <div><label>BMI</label><input type="number" step="0.1" name="bmi" min="12" max="60" value="{{ charges_values['bmi'] }}"></div>
+    <div><label>Children</label><input type="number" name="children" min="0" max="10" value="{{ charges_values['children'] }}"></div>
+    <div><label>Sex</label><select name="sex">
+      {% for option in ['male', 'female'] %}
+        <option value="{{ option }}" {{ 'selected' if charges_values['sex'] == option }}>{{ option }}</option>
+      {% endfor %}
+    </select></div>
+    <div><label>Smoker</label><select name="smoker">
+      {% for option in ['no', 'yes'] %}
+        <option value="{{ option }}" {{ 'selected' if charges_values['smoker'] == option }}>{{ option }}</option>
+      {% endfor %}
+    </select></div>
+    <div><label>Region</label><select name="region">
+      {% for option in regions %}
+        <option value="{{ option }}" {{ 'selected' if charges_values['region'] == option }}>{{ option }}</option>
+      {% endfor %}
+    </select></div>
+  </div>
+  <button type="submit">Predict charges</button>
+</form>
+
+{% if charges_result %}
+<div class="result">
+  <div>Predicted annual charges</div>
+  <div class="big">${{ '{:,.0f}'.format(charges_result['predicted_charges']) }}</div>
+  <p class="note">Typical error on held-out data is a few thousand dollars. An estimate of
+  an average, not a quote.</p>
+</div>
+{% endif %}
+
+{% else %}
+
+<p class="note">This model flags anyone above a <strong>{{ '%.1f'|format(threshold * 100) }}%</strong>
+probability, not the usual 50%. The threshold targets about 75% recall, accepting that
+most flags are false alarms.</p>
+
+<form method="post">
+  <input type="hidden" name="form" value="diabetes">
+  <div class="grid">
+    {% for name, label, kind, options, default in diabetes_fields %}
+      <div>
+        <label>{{ label }}</label>
+        {% if kind == 'number' %}
+          <input type="number" name="{{ name }}" min="{{ options[0] }}" max="{{ options[1] }}"
+                 value="{{ diabetes_values[name] }}">
+        {% else %}
+          <select name="{{ name }}">
+            {% for value, text in (lookups.get(name) or yes_no).items() %}
+              <option value="{{ value }}" {{ 'selected' if diabetes_values[name]|int == value }}>{{ text }}</option>
+            {% endfor %}
+          </select>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+  <button type="submit">Estimate risk</button>
+</form>
+
+{% if diabetes_result %}
+<div class="result {{ 'flag' if diabetes_result['flagged'] else '' }}">
+  <div>Estimated risk</div>
+  <div class="big">{{ '%.1f'|format(diabetes_result['risk_probability'] * 100) }}%</div>
+  <p><strong>{{ 'Flagged for screening' if diabetes_result['flagged'] else 'Not flagged' }}</strong>
+     — risk is {{ diabetes_result['band'] }}
+     (threshold {{ '%.1f'|format(diabetes_result['threshold'] * 100) }}%).</p>
+  <p class="note">Not a diagnosis. A statistical association learned from a 2015 telephone
+  survey, wrong about roughly two thirds of the people it flags.</p>
+</div>
+{% endif %}
+
+{% endif %}
+
+<hr style="margin:2.5rem 0 1rem; border:0; border-top:1px solid var(--line)">
+<p class="note">
+  Serving <code>{{ info.get('diabetes_model', '?') }}</code> and
+  <code>{{ info.get('charges_model', '?') }}</code>.
+  JSON API: <code>POST /api/charges</code>, <code>POST /api/diabetes</code>,
+  <code>GET /health</code>.
+</p>
+
+{% endif %}
+</body>
+</html>
