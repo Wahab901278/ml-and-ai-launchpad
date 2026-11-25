@@ -1,0 +1,11 @@
+# Pinned so the container you build today is the container you build in March.
+scikit-learn==1.6.1
+pandas==2.2.3
+numpy==1.26.4
+joblib==1.4.2
+streamlit==1.45.1
+flask==3.1.0
+gunicorn==23.0.0
+
+# Only needed by train_models.py, not by the running app:
+huggingface-hub==0.35.1

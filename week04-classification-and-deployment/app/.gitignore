@@ -1,0 +1,7 @@
+# Model artifacts are built, not committed. `python train_models.py` regenerates them.
+models/*.joblib
+models/*.json
+
+# Local experiment tracking
+mlruns/
+mlflow.db

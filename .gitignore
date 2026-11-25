@@ -30,3 +30,18 @@ env/
 *.xlsx
 *.csv
 !**/data/*.csv
+
+# --- Virtual environments (any prefix: venv, .venv, ann_venv, rnn_venv, llm-venv) ---
+*venv/
+*venv.bak/
+
+# --- Gradio / Streamlit / TensorBoard runtime artifacts ---
+.gradio/
+.streamlit/secrets.toml
+**/logs/fit/
+
+# --- Anaconda / Jupyter project metadata ---
+anaconda_projects/
+
+# --- Third-party course material, not our work (lives upstream) ---
+week06-multi-model-uis-and-rag-concepts/Multi-modal-chatbot/community-contributions/

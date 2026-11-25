@@ -1,0 +1,7 @@
+python-dotenv
+openai
+ipython
+requests
+beautifulsoup4
+tiktoken
+gradio
